@@ -22,7 +22,28 @@ from .ui import Dashboard
 from .utils import country_flag, is_private_ip
 
 
-DEFAULT_CACHE = str(Path.home() / ".cache" / "ipmonitor" / "geoip.json")
+def _default_cache_path() -> Path:
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Local"
+        return root / "ipmonitor" / "geoip.json"
+    return Path.home() / ".cache" / "ipmonitor" / "geoip.json"
+
+
+def _is_admin() -> bool:
+    """Cross-platform 'are we elevated' check."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+        except Exception:
+            return False
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0  # type: ignore[attr-defined]
+    return False
+
+
+DEFAULT_CACHE = str(_default_cache_path())
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,12 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
             "geolocalización por país y dashboard TUI."
         ),
         epilog=(
-            "Ejemplos:\n"
-            "  sudo -E python -m ipmonitor\n"
-            "  sudo -E python -m ipmonitor -i eth0 -f 'tcp or udp'\n"
-            "  sudo -E python -m ipmonitor --no-ui --duration 30 "
-            "--export-json sesion.json\n"
+            "Ejemplos (Windows / PowerShell como Administrador):\n"
             "  python -m ipmonitor --list-interfaces\n"
+            "  python -m ipmonitor -i \"Wi-Fi\" -f \"tcp or udp\"\n"
+            "  python -m ipmonitor --no-ui --duration 30 "
+            "--export-json sesion.json\n"
+            "  .\\run.ps1                 # lanzador con auto-elevación UAC\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -117,21 +138,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     if args.list_interfaces:
-        ifs = CaptureEngine.list_interfaces()
-        if not ifs:
-            console.print("[yellow]No se pudieron listar interfaces.[/]")
+        details = CaptureEngine.list_interfaces_detailed()
+        if not details:
+            console.print(
+                "[yellow]No se pudieron listar interfaces.[/] "
+                "En Windows necesitas [cyan]Npcap[/] instalado "
+                "(https://npcap.com)."
+            )
             return 1
         console.print("[bold]Interfaces disponibles:[/]")
-        for i in ifs:
-            console.print(f"  • {i}")
+        for d in details:
+            name = d.get("name") or d.get("guid") or "?"
+            desc = d.get("description") or ""
+            ips = ", ".join(d.get("ips") or []) or "-"
+            mac = d.get("mac") or ""
+            console.print(
+                f"  • [bold cyan]{name}[/]  [dim]{desc}[/]\n"
+                f"      ips: {ips}   mac: {mac or '-'}"
+            )
         return 0
 
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        console.print(
-            "[yellow]Aviso:[/] la captura suele requerir root. "
-            "Ejecuta como [cyan]sudo -E python -m ipmonitor[/] "
-            "o concede [cyan]CAP_NET_RAW[/] al binario de python."
-        )
+    if not _is_admin():
+        if sys.platform == "win32":
+            console.print(
+                "[yellow]Aviso:[/] la captura requiere [bold]Administrador[/]. "
+                "Abre PowerShell como Administrador o ejecuta [cyan].\\run.ps1[/] "
+                "(eleva por UAC). También necesitas [cyan]Npcap[/] instalado "
+                "(https://npcap.com)."
+            )
+        else:
+            console.print(
+                "[yellow]Aviso:[/] la captura suele requerir root. "
+                "Ejecuta como [cyan]sudo -E python -m ipmonitor[/] "
+                "o concede [cyan]CAP_NET_RAW[/] al binario de python."
+            )
 
     geoip = GeoIPResolver(
         mmdb_path=args.mmdb, cache_path=args.cache, offline=args.offline,
@@ -162,7 +202,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             dashboard.stop()
 
     signal.signal(signal.SIGINT, shutdown)
-    signal.signal(signal.SIGTERM, shutdown)
+    if hasattr(signal, "SIGBREAK"):  # Windows: Ctrl+Break
+        try:
+            signal.signal(signal.SIGBREAK, shutdown)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if sys.platform != "win32":
+        try:
+            signal.signal(signal.SIGTERM, shutdown)
+        except (ValueError, OSError):
+            pass
 
     try:
         engine.start()

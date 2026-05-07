@@ -106,3 +106,54 @@ class CaptureEngine:
             return list(get_if_list())
         except Exception:
             return []
+
+    @staticmethod
+    def list_interfaces_detailed() -> List[dict]:
+        """Return [{name, description, ips, mac, guid}, ...] across platforms.
+
+        On Windows uses scapy's ``get_windows_if_list`` which returns the
+        friendly name (the value you should pass to ``-i``).
+        """
+        if not HAVE_SCAPY:
+            return []
+        import sys
+        if sys.platform == "win32":
+            try:
+                from scapy.arch.windows import get_windows_if_list  # type: ignore
+                out = []
+                for d in get_windows_if_list():
+                    out.append({
+                        "name": d.get("name") or d.get("description") or "",
+                        "description": d.get("description") or "",
+                        "ips": d.get("ips") or [],
+                        "mac": d.get("mac") or "",
+                        "guid": d.get("guid") or "",
+                    })
+                return out
+            except Exception:
+                pass
+        # Generic fallback: best-effort using scapy's IFACES table.
+        try:
+            from scapy.config import conf  # type: ignore
+            out = []
+            for nic in getattr(conf, "ifaces", {}).values():
+                ips = []
+                for attr in ("ips", "ip", "ip4"):
+                    val = getattr(nic, attr, None)
+                    if isinstance(val, list):
+                        ips.extend(str(v) for v in val)
+                    elif isinstance(val, str) and val:
+                        ips.append(val)
+                out.append({
+                    "name": getattr(nic, "name", "") or getattr(nic, "network_name", ""),
+                    "description": getattr(nic, "description", "") or "",
+                    "ips": ips,
+                    "mac": getattr(nic, "mac", "") or "",
+                    "guid": getattr(nic, "guid", "") or "",
+                })
+            if out:
+                return out
+        except Exception:
+            pass
+        return [{"name": n, "description": "", "ips": [], "mac": "", "guid": ""}
+                for n in CaptureEngine.list_interfaces()]

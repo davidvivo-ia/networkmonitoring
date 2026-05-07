@@ -40,41 +40,79 @@ saludable sobre tu propia máquina.
 - Tolerante a fallos: si `ip-api.com` está caído o `geoip2` no está
   instalado, sigue funcionando offline.
 
-## Instalación
+## Instalación (Windows)
 
-Requiere Python 3.9+ y permisos de captura (`CAP_NET_RAW` o root).
+Requisitos:
 
-```bash
+1. **Python 3.9+** (https://www.python.org/downloads/windows — marca *Add
+   Python to PATH* en el instalador).
+2. **Npcap** (https://npcap.com), driver de captura. Durante la instalación
+   marca **“Install Npcap in WinPcap API-compatible mode”**.
+3. Una **terminal con privilegios de Administrador** (PowerShell o cmd
+   abiertos con *Run as administrator*). La captura de paquetes requiere
+   privilegios elevados.
+
+Pasos:
+
+```powershell
 git clone https://github.com/davidvivo-ia/networkmonitoring.git
 cd networkmonitoring
-python3 -m venv .venv
-source .venv/bin/activate
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-Atajo: `./run.sh` crea el venv y lanza con `sudo` automáticamente.
+### Atajo: `run.ps1` (auto-eleva por UAC)
 
-## Uso
+```powershell
+# En la carpeta del proyecto, desde una PowerShell normal:
+.\run.ps1
+```
+
+`run.ps1` crea el venv si no existe, instala dependencias, y abre una
+ventana elevada por UAC con el dashboard. También puedes invocar
+`run.bat` (que delega en `run.ps1`).
+
+> Si PowerShell bloquea el script con un error de política de ejecución,
+> ejecuta una vez:
+> `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+
+### Linux / macOS
+
+También funciona en Linux/macOS (con `libpcap`):
 
 ```bash
-# Lo más simple (todas las interfaces, sin filtro):
-sudo -E python -m ipmonitor
-
-# Interfaz específica + filtro BPF:
-sudo -E python -m ipmonitor -i eth0 -f "tcp or udp"
-
-# Solo tráfico hacia/desde 8.8.8.8:
-sudo -E python -m ipmonitor -f "host 8.8.8.8"
-
-# 30 segundos en modo headless con informe JSON:
-sudo -E python -m ipmonitor --no-ui --duration 30 --export-json sesion.json
-
-# Modo offline puro (requiere --mmdb GeoLite2):
-sudo -E python -m ipmonitor --offline --mmdb /var/lib/GeoLite2-City.mmdb
-
-# Listar interfaces disponibles:
-python -m ipmonitor --list-interfaces
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+sudo -E python -m ipmonitor          # o usa ./run.sh
 ```
+
+## Uso (Windows, PowerShell elevada)
+
+```powershell
+# 1) Listar interfaces para saber el nombre amigable que tienes que pasar:
+python -m ipmonitor --list-interfaces
+
+# 2) Captura completa con dashboard:
+python -m ipmonitor
+
+# 3) Interfaz concreta + filtro BPF (igual que tcpdump):
+python -m ipmonitor -i "Wi-Fi" -f "tcp or udp"
+
+# 4) Solo tráfico hacia/desde 8.8.8.8:
+python -m ipmonitor -f "host 8.8.8.8"
+
+# 5) 30 segundos en modo headless con informe JSON:
+python -m ipmonitor --no-ui --duration 30 --export-json sesion.json
+
+# 6) Modo offline puro con GeoLite2 (sin llamadas a Internet):
+python -m ipmonitor --offline --mmdb C:\datos\GeoLite2-City.mmdb
+```
+
+En Windows el flag `-i` espera el **nombre amigable** que ves en
+*“Conexiones de red”* (`Wi-Fi`, `Ethernet`, `vEthernet (Default Switch)`…).
+Si `--list-interfaces` te muestra rutas con GUID (`\Device\NPF_{...}`),
+también las acepta — ese GUID es lo que entiende Npcap por debajo.
 
 ### Argumentos
 
@@ -94,13 +132,12 @@ python -m ipmonitor --list-interfaces
 
 ### Permisos
 
-La captura de paquetes requiere privilegios:
+La captura requiere privilegios elevados:
 
-- `sudo` (más simple, ojo con la variable `PATH`: usa `sudo -E`).
-- O concede capacidad sin root al binario de Python:
-  ```bash
-  sudo setcap cap_net_raw,cap_net_admin=eip "$(readlink -f $(which python3))"
-  ```
+- **Windows**: PowerShell o cmd como *Administrador*. `run.ps1` lo gestiona
+  por ti (UAC). Necesitas además **Npcap** instalado.
+- **Linux**: `sudo -E python -m ipmonitor` o concede capacidades sin root:
+  `sudo setcap cap_net_raw,cap_net_admin=eip "$(readlink -f $(which python3))"`.
 
 ## Arquitectura
 

@@ -1,17 +1,17 @@
-"""Live packet capture engine built on top of scapy's AsyncSniffer."""
+"""Live packet capture engine built on scapy's AsyncSniffer."""
 
 from __future__ import annotations
 
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .stats import PacketRecord
 
-try:  # scapy is optional at import-time so --help still works without root.
+try:
     from scapy.all import AsyncSniffer, ICMP, IP, IPv6, TCP, UDP  # type: ignore
 
     _HAVE_SCAPY = True
-except BaseException:  # pragma: no cover - covers ImportError + downstream issues
+except BaseException:  # pragma: no cover
     _HAVE_SCAPY = False
 
 
@@ -23,15 +23,18 @@ _PROTO_MAP = {
     103: "PIM", 132: "SCTP",
 }
 
+PacketCallback = Callable[[PacketRecord, "object"], None]
+
 
 class CaptureEngine:
-    """Wrapper around scapy.AsyncSniffer that emits :class:`PacketRecord`s."""
+    """AsyncSniffer wrapper emitting (record, raw_pkt) to each consumer."""
 
     def __init__(
         self,
         interface: Optional[str] = None,
         bpf_filter: Optional[str] = None,
-        on_packet: Optional[Callable[[PacketRecord], None]] = None,
+        on_packet: Optional[PacketCallback] = None,
+        promisc: bool = True,
     ):
         if not HAVE_SCAPY:
             raise RuntimeError(
@@ -40,14 +43,21 @@ class CaptureEngine:
         self.interface = interface
         self.bpf_filter = bpf_filter
         self.on_packet = on_packet
+        self.promisc = promisc
         self._sniffer: Optional["AsyncSniffer"] = None  # type: ignore[name-defined]
 
     # ------------------------------------------------------------------ run
 
-    def _handle(self, pkt) -> None:  # pragma: no cover (requires live capture)
+    def _parse(self, pkt) -> Optional[PacketRecord]:
         try:
             ts = float(pkt.time) if hasattr(pkt, "time") else time.time()
+        except Exception:
+            ts = time.time()
+        try:
             length = len(pkt)
+        except Exception:
+            length = 0
+        try:
             if IP in pkt:
                 ip = pkt[IP]
                 src, dst = ip.src, ip.dst
@@ -57,8 +67,12 @@ class CaptureEngine:
                 src, dst = ip.src, ip.dst
                 proto_num = int(ip.nh)
             else:
-                return
-            sport = dport = 0
+                return None
+        except Exception:
+            return None
+
+        sport = dport = 0
+        try:
             if TCP in pkt:
                 proto = "TCP"
                 sport, dport = int(pkt[TCP].sport), int(pkt[TCP].dport)
@@ -69,12 +83,20 @@ class CaptureEngine:
                 proto = "ICMP"
             else:
                 proto = _PROTO_MAP.get(proto_num, f"IP/{proto_num}")
-            rec = PacketRecord(
-                ts=ts, src=src, dst=dst, proto=proto,
-                sport=sport, dport=dport, length=length,
-            )
-            if self.on_packet is not None:
-                self.on_packet(rec)
+        except Exception:
+            proto = "?"
+
+        return PacketRecord(
+            ts=ts, src=src, dst=dst, proto=proto,
+            sport=sport, dport=dport, length=length,
+        )
+
+    def _handle(self, pkt) -> None:  # pragma: no cover (needs live capture)
+        rec = self._parse(pkt)
+        if rec is None or self.on_packet is None:
+            return
+        try:
+            self.on_packet(rec, pkt)
         except Exception:
             return
 
@@ -84,6 +106,7 @@ class CaptureEngine:
             kwargs["iface"] = self.interface
         if self.bpf_filter:
             kwargs["filter"] = self.bpf_filter
+        # AsyncSniffer accepts promisc on POSIX; Windows/Npcap default is fine.
         self._sniffer = AsyncSniffer(**kwargs)
         self._sniffer.start()
 
@@ -109,11 +132,6 @@ class CaptureEngine:
 
     @staticmethod
     def list_interfaces_detailed() -> List[dict]:
-        """Return [{name, description, ips, mac, guid}, ...] across platforms.
-
-        On Windows uses scapy's ``get_windows_if_list`` which returns the
-        friendly name (the value you should pass to ``-i``).
-        """
         if not HAVE_SCAPY:
             return []
         import sys
@@ -132,7 +150,6 @@ class CaptureEngine:
                 return out
             except Exception:
                 pass
-        # Generic fallback: best-effort using scapy's IFACES table.
         try:
             from scapy.config import conf  # type: ignore
             out = []

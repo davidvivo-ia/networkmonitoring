@@ -60,3 +60,32 @@ def test_unknown_geo_skipped():
     snap = s.snapshot()
     assert snap["countries"] == []
     assert snap["total_packets"] == 1
+
+
+def test_hostname_and_process_accounting():
+    s = StatsAggregator()
+    now = time.time()
+    s.record(
+        PacketRecord(ts=now, src="1.1.1.1", dst="8.8.8.8",
+                     proto="UDP", sport=1000, dport=53, length=200),
+        src_geo=None,
+        dst_geo=_geo("United States", "US"),
+        hostname="google.com",
+        process=(4321, "chrome.exe"),
+    )
+    snap = s.snapshot()
+    assert snap["top_hosts"][0] == ("google.com", 200)
+    assert "chrome.exe" in snap["top_procs_bytes"][0][0]
+
+
+def test_continent_aggregation():
+    s = StatsAggregator()
+    s.record(
+        PacketRecord(ts=time.time(), src="1.1.1.1", dst="2.2.2.2",
+                     proto="TCP", sport=1, dport=443, length=100),
+        src_geo=_geo("Spain", "ES"),
+        dst_geo=_geo("United States", "US"),
+    )
+    snap = s.snapshot()
+    conts = {c["continent"] for c in snap["continents"]}
+    assert conts == {"EU", "NA"}

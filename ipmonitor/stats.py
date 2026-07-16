@@ -1,4 +1,9 @@
-"""Thread-safe aggregation of packet metadata (totals, rates, top-talkers, geo)."""
+"""Thread-safe aggregation of packet metadata.
+
+Tracks totals, rates, top-talkers, per-country/continent aggregation, per-ASN
+counters, per-hostname and per-process counters, plus a rolling bandwidth
+history used to render sparklines.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,8 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+
+from .continents import continent_for
 
 
 @dataclass
@@ -39,41 +46,77 @@ class CountryStats:
     unique_ips: Set[str] = field(default_factory=set)
 
 
+@dataclass
+class ContinentStats:
+    continent: str
+    name: str
+    emoji: str
+    packets: int = 0
+    bytes: int = 0
+    countries: Set[str] = field(default_factory=set)
+
+
 class StatsAggregator:
-    """Lock-protected counters for the live dashboard.
+    HISTORY_BUCKET_SECONDS = 1.0
+    HISTORY_BUCKETS = 60
 
-    Geolocation is associated with each packet at record-time by the caller
-    (so we keep this module independent of the resolver implementation).
-    """
-
-    def __init__(self, history_seconds: int = 30, recent_size: int = 200):
+    def __init__(self, history_seconds: int = 30, recent_size: int = 300):
         self._lock = threading.Lock()
         self.start_ts = time.time()
+
+        # totals -----------------------------------------------------------
         self.total_packets = 0
         self.total_bytes = 0
+        self.dropped_pdu = 0
+
+        # per-protocol -----------------------------------------------------
         self.protocol_counts: Counter = Counter()
         self.protocol_bytes: Counter = Counter()
+
+        # per-endpoint -----------------------------------------------------
         self.src_ip_counts: Counter = Counter()
         self.dst_ip_counts: Counter = Counter()
         self.src_ip_bytes: Counter = Counter()
         self.dst_ip_bytes: Counter = Counter()
         self.dst_port_counts: Counter = Counter()
         self.src_port_counts: Counter = Counter()
+
+        # geo --------------------------------------------------------------
         self.country_stats: Dict[str, CountryStats] = {}
+        self.continent_stats: Dict[str, ContinentStats] = {}
+        self.asn_counts: Counter = Counter()
+        self.asn_bytes: Counter = Counter()
+
+        # l7 / apps --------------------------------------------------------
+        self.hostname_counts: Counter = Counter()
+        self.hostname_bytes: Counter = Counter()
+        self.process_counts: Counter = Counter()
+        self.process_bytes: Counter = Counter()
+
+        # flows + recent ---------------------------------------------------
         self.flows: Dict[Tuple[str, str, str, int], FlowStats] = {}
-        self.recent: Deque[PacketRecord] = deque(maxlen=recent_size)
+        self.recent: Deque[Dict[str, Any]] = deque(maxlen=recent_size)
         self.unique_ips: Set[str] = set()
+
+        # rolling windows --------------------------------------------------
+        self.history_seconds = history_seconds
         self._byte_window: Deque[Tuple[float, int]] = deque()
         self._packet_window: Deque[Tuple[float, int]] = deque()
-        self.history_seconds = history_seconds
 
-    # ------------------------------------------------------------- recording
+        # sparkline history: bucketized per second -------------------------
+        self._history_bytes: Deque[int] = deque(maxlen=self.HISTORY_BUCKETS)
+        self._history_packets: Deque[int] = deque(maxlen=self.HISTORY_BUCKETS)
+        self._history_bucket_ts: float = 0.0
+
+    # ----------------------------------------------------------- recording
 
     def record(
         self,
         pkt: PacketRecord,
         src_geo: Optional[Any] = None,
         dst_geo: Optional[Any] = None,
+        hostname: Optional[str] = None,
+        process: Optional[Tuple[int, str]] = None,
     ) -> None:
         with self._lock:
             self.total_packets += 1
@@ -92,7 +135,6 @@ class StatsAggregator:
 
             self.unique_ips.add(pkt.src)
             self.unique_ips.add(pkt.dst)
-            self.recent.appendleft(pkt)
 
             key = (pkt.src, pkt.dst, pkt.proto, pkt.dport)
             f = self.flows.get(key)
@@ -103,30 +145,64 @@ class StatsAggregator:
             f.bytes += pkt.length
             f.last_seen = pkt.ts
 
-            if src_geo is not None and getattr(src_geo, "country_code", "??") != "??":
-                cs = self.country_stats.setdefault(
-                    src_geo.country_code,
-                    CountryStats(
-                        country=src_geo.country, country_code=src_geo.country_code
-                    ),
-                )
-                cs.packets_in += 1
-                cs.bytes_in += pkt.length
-                cs.unique_ips.add(pkt.src)
-            if dst_geo is not None and getattr(dst_geo, "country_code", "??") != "??":
-                cs = self.country_stats.setdefault(
-                    dst_geo.country_code,
-                    CountryStats(
-                        country=dst_geo.country, country_code=dst_geo.country_code
-                    ),
-                )
-                cs.packets_out += 1
-                cs.bytes_out += pkt.length
-                cs.unique_ips.add(pkt.dst)
+            self._account_geo(pkt, src_geo, dst_geo)
+
+            if hostname:
+                self.hostname_counts[hostname] += 1
+                self.hostname_bytes[hostname] += pkt.length
+
+            if process:
+                pid, pname = process
+                key_p = f"{pname} [{pid}]"
+                self.process_counts[key_p] += 1
+                self.process_bytes[key_p] += pkt.length
+
+            self.recent.appendleft({
+                "ts": pkt.ts, "src": pkt.src, "dst": pkt.dst,
+                "proto": pkt.proto, "sport": pkt.sport, "dport": pkt.dport,
+                "length": pkt.length,
+                "hostname": hostname or "",
+                "process": process[1] if process else "",
+                "cc_src": getattr(src_geo, "country_code", "") if src_geo else "",
+                "cc_dst": getattr(dst_geo, "country_code", "") if dst_geo else "",
+            })
 
             self._byte_window.append((pkt.ts, pkt.length))
             self._packet_window.append((pkt.ts, 1))
             self._trim_windows(pkt.ts)
+            self._push_history(pkt.ts, pkt.length)
+
+    # --------------------------------------------------------- geo helpers
+
+    def _account_geo(self, pkt, src_geo, dst_geo) -> None:
+        for geo, is_dst in ((src_geo, False), (dst_geo, True)):
+            if geo is None or getattr(geo, "country_code", "??") == "??":
+                continue
+            cc = geo.country_code
+            cs = self.country_stats.setdefault(
+                cc, CountryStats(country=geo.country, country_code=cc)
+            )
+            if is_dst:
+                cs.packets_out += 1
+                cs.bytes_out += pkt.length
+                cs.unique_ips.add(pkt.dst)
+            else:
+                cs.packets_in += 1
+                cs.bytes_in += pkt.length
+                cs.unique_ips.add(pkt.src)
+
+            cont, cname, emoji = continent_for(cc)
+            ct = self.continent_stats.setdefault(
+                cont, ContinentStats(continent=cont, name=cname, emoji=emoji)
+            )
+            ct.packets += 1
+            ct.bytes += pkt.length
+            ct.countries.add(cc)
+
+            asn = getattr(geo, "asn", "") or ""
+            if asn:
+                self.asn_counts[asn] += 1
+                self.asn_bytes[asn] += pkt.length
 
     def _trim_windows(self, now: float) -> None:
         cutoff = now - self.history_seconds
@@ -135,7 +211,20 @@ class StatsAggregator:
         while self._packet_window and self._packet_window[0][0] < cutoff:
             self._packet_window.popleft()
 
-    # --------------------------------------------------------------- queries
+    def _push_history(self, now: float, length: int) -> None:
+        bucket = int(now // self.HISTORY_BUCKET_SECONDS)
+        if self._history_bucket_ts == 0.0:
+            self._history_bucket_ts = bucket
+            self._history_bytes.append(0)
+            self._history_packets.append(0)
+        while self._history_bucket_ts < bucket:
+            self._history_bucket_ts += 1
+            self._history_bytes.append(0)
+            self._history_packets.append(0)
+        self._history_bytes[-1] += length
+        self._history_packets[-1] += 1
+
+    # ----------------------------------------------------------- accessors
 
     def rates(self) -> Tuple[float, float]:
         now = time.time()
@@ -145,6 +234,10 @@ class StatsAggregator:
             bps = sum(b for _, b in self._byte_window) / window
             pps = sum(p for _, p in self._packet_window) / window
         return bps, pps
+
+    def history(self) -> Tuple[List[int], List[int]]:
+        with self._lock:
+            return list(self._history_bytes), list(self._history_packets)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -162,6 +255,14 @@ class StatsAggregator:
                 }
                 for cs in self.country_stats.values()
             ]
+            continents = [
+                {
+                    "continent": ct.continent, "name": ct.name, "emoji": ct.emoji,
+                    "packets": ct.packets, "bytes": ct.bytes,
+                    "countries": len(ct.countries),
+                }
+                for ct in self.continent_stats.values()
+            ]
             return {
                 "start_ts": self.start_ts,
                 "elapsed": time.time() - self.start_ts,
@@ -176,17 +277,18 @@ class StatsAggregator:
                 "top_dst_bytes": self.dst_ip_bytes.most_common(20),
                 "top_dport": self.dst_port_counts.most_common(15),
                 "top_sport": self.src_port_counts.most_common(15),
+                "top_hosts": self.hostname_bytes.most_common(15),
+                "top_hosts_pkts": self.hostname_counts.most_common(15),
+                "top_asn": self.asn_bytes.most_common(10),
+                "top_procs_bytes": self.process_bytes.most_common(12),
+                "top_procs_pkts": self.process_counts.most_common(12),
                 "countries": countries,
+                "continents": continents,
                 "flows": [
                     {
-                        "src": k[0],
-                        "dst": k[1],
-                        "proto": k[2],
-                        "dport": k[3],
-                        "packets": v.packets,
-                        "bytes": v.bytes,
-                        "first_seen": v.first_seen,
-                        "last_seen": v.last_seen,
+                        "src": k[0], "dst": k[1], "proto": k[2], "dport": k[3],
+                        "packets": v.packets, "bytes": v.bytes,
+                        "first_seen": v.first_seen, "last_seen": v.last_seen,
                     }
                     for k, v in self.flows.items()
                 ],

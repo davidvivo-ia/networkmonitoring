@@ -1,0 +1,32 @@
+# Ejemplo de configuración de ipmonitor.
+# Copia este fichero a:
+#   Windows:  %APPDATA%\ipmonitor\ipmonitor.toml
+#   Linux:    ~/.config/ipmonitor.toml
+# o pásalo con --config ipmonitor.toml.
+#
+# Todas las secciones y claves son opcionales; los CLI flags las sobreescriben.
+
+[defaults]
+# interface = "Wi-Fi"
+# bpf       = "tcp or udp"
+# mmdb      = "C:/datos/GeoLite2-City.mmdb"
+# offline   = false
+# no_procs  = false
+# no_ui     = false
+# pcap      = "sesion.pcap"
+
+[alerts]
+# Códigos ISO alpha-2. Cualquier paquete hacia/desde estos países dispara CRIT.
+# block_countries = ["RU", "KP", "IR"]
+
+# Puertos vigilados (alerta WARN si se conecta a alguno).
+# block_ports = [23, 445, 3389]
+
+# Umbral en bytes/s para alertas de picos de ancho de banda (~10 MB/s = 10485760).
+# rate_bytes_per_sec = 10485760
+
+# Silencia las alertas informativas "nuevo país detectado".
+# silence_new_country = false
+
+[ui]
+# refresh = 4      # refrescos/segundo del dashboard

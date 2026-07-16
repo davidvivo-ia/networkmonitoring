@@ -1,12 +1,13 @@
-"""Export and final-summary helpers for offline analysis."""
+"""Export helpers and end-of-session summary."""
 
 from __future__ import annotations
 
 import csv
 import json
 import time
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from rich import box
 from rich.console import Console
@@ -15,27 +16,36 @@ from rich.table import Table
 from .stats import StatsAggregator
 from .utils import country_flag, format_bytes
 
-if TYPE_CHECKING:  # avoid hard import-time dependency for export-only paths
+if TYPE_CHECKING:
+    from .alerts import AlertEngine
     from .geoip import GeoIPResolver
+    from .hosts import HostRegistry
 
 
 class Exporter:
-    def __init__(self, stats: StatsAggregator, geoip: "GeoIPResolver"):
+    def __init__(
+        self,
+        stats: StatsAggregator,
+        geoip: "GeoIPResolver",
+        hosts: Optional["HostRegistry"] = None,
+        alerts: Optional["AlertEngine"] = None,
+    ):
         self.stats = stats
         self.geoip = geoip
+        self.hosts = hosts
+        self.alerts = alerts
 
     # -------------------------------------------------------- serialisation
 
     def to_json(self, path: str) -> None:
         snap = self.stats.snapshot()
-        snap["recent"] = [
-            {
-                "ts": p.ts, "src": p.src, "dst": p.dst, "proto": p.proto,
-                "sport": p.sport, "dport": p.dport, "length": p.length,
-            }
-            for p in snap["recent"]
-        ]
         snap["generated_at"] = time.time()
+        if self.hosts is not None:
+            snap["hostnames"] = self.hosts.snapshot()
+        if self.alerts is not None:
+            snap["alerts"] = [
+                asdict(a) if is_dataclass(a) else a for a in self.alerts.all()
+            ]
         Path(path).expanduser().write_text(
             json.dumps(snap, indent=2, default=str), encoding="utf-8"
         )
@@ -96,6 +106,22 @@ class Exporter:
                 )
             console.print(t)
 
+        if snap.get("top_hosts"):
+            t = Table(title="Top dominios", box=box.SIMPLE)
+            t.add_column("Dominio")
+            t.add_column("Bytes", justify="right")
+            for host, byts in snap["top_hosts"][:20]:
+                t.add_row(host, format_bytes(byts))
+            console.print(t)
+
+        if snap.get("top_procs_bytes"):
+            t = Table(title="Top procesos", box=box.SIMPLE)
+            t.add_column("Proceso")
+            t.add_column("Bytes", justify="right")
+            for proc, byts in snap["top_procs_bytes"][:15]:
+                t.add_row(proc, format_bytes(byts))
+            console.print(t)
+
         protos = sorted(
             snap["protocol_counts"].items(), key=lambda x: x[1], reverse=True
         )
@@ -110,3 +136,14 @@ class Exporter:
                     format_bytes(snap["protocol_bytes"].get(proto, 0)),
                 )
             console.print(t)
+
+        if self.alerts is not None:
+            alerts_all = self.alerts.all()
+            if alerts_all:
+                t = Table(title="Alertas", box=box.SIMPLE)
+                t.add_column("Regla")
+                t.add_column("Sev")
+                t.add_column("Mensaje")
+                for a in alerts_all[:30]:
+                    t.add_row(a.rule, a.severity, a.message)
+                console.print(t)
